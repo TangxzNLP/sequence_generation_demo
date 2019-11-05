@@ -106,9 +106,9 @@ class TextDataset(object):
           
     
 convert = TextConverter('./dataset/poetry.txt', max_vocab=10000)
+txt_char = poetry_corpus[:11]
 n_step =20
 num_seq = int(len(poetry_corpus)/n_step)
-
 text = poetry_corpus[:num_seq * n_step]   
 
 import torch
@@ -129,19 +129,146 @@ x, y = train_set[0]
 from torch import nn
 from torch.autograd import Variable
 
-use_gpu = Ture
+use_gpu = True
+
+
 
 class CharRNN(nn.Module):
     def __init__(self, num_classes, embed_dim, hidden_size, num_layers, dropout):
-        super("tangRNN", self).__init__()
+        super(RNNmodel, self).__init__()
         self.num_layers = num_layers
         self.hidden_size = hidden_size
+        # num_classes个词,纬度是embed_dim
         self.word_to_vec = nn.Embedding(num_classes, embed_dim)
-        self.rnn = nn.GRU(embed_dim, hidden_size, num_layers, dropout)
+        self.rnn = nn.RNN(embed_dim, hidden_size, num_layers, dropout)
         self.project = nn.Linear(hidden_size, num_classes)
     
     def forward(self, x, hs = None):
-        batch = x.shape
+        batch = x.shape[0]
+        if hs is None:
+            hs = Variable(torch.zeros(self.num_layers, batch, self.hidden_size))
+            if use_gpu:
+                hs = hs.cuda()
+        word_embed = self.word_to_vec(x)
+        word_embed= word_embed.permute(1, 0, 2)
+        out, h0 =self.rnn(word_embed, hs)
+        le, mb, hd = out.shape
+        out = out.view(le * mb, hd)
+        out = self.project(out)
+        out = out.view(le, mb, -1)
+        out = out.permute(1, 0, 2).contiguous()
+        return out.view(-1, out.shape[2]), h0
+
+class ScheduledOptim(object):
+    """A wrapper class for learning rate scheduling
+    """
+
+    def __init__(self, optimizer):
+        self.optimizer = optimizer
+        self.lr = self.optimizer.param_groups[0]['lr']
+        self.current_steps = 0
+
+    def step(self):
+        "Step by the inner optimizer"
+        self.current_steps += 1
+        self.optimizer.step()
+
+    def zero_grad(self):
+        "Zero out the gradients by the inner optimizer"
+        self.optimizer.zero_grad()
+
+    def lr_multi(self, multi):
+        for param_group in self.optimizer.param_groups:
+            param_group['lr'] *= multi
+        self.lr = self.optimizer.param_groups[0]['lr']
+
+    def set_learning_rate(self, lr):
+        self.lr = lr
+        for param_group in self.optimizer.param_groups:
+            param_group['lr'] = lr
+
+    @property
+    def learning_rate(self):
+        return self.lr
+    
+# 训练模型
+from torch.utils.data import DataLoader
+batch_size = 128
+train_data = DataLoader(train_set, batch_size, True, num_workers = 4)
+
+
+model = CharRNN(convert.vocab_size, 512, 512, 2, 0.5)
+if use_gpu:
+    model = model.cuda()
+criterion = nn.CrossEntropyLoss()
+basic_optimizer = torch.optim.Adam(model.parameters(), lr = le-3)
+optimizer = ScheduledOptim(basic_optimizer)
+
+epoch = 20
+for e in range(epoches):
+    train_loss = 0
+    for data in train_data:
+        x, y = data
+        y = y.long()
+        if use_gpu:
+            x = x.cuda()
+            y = y.cuda()
+        x, y = Variable(x), Variable(y)
+        
+        # Forward
+        score, _ = model(x)
+        loss = criterion(score, y.view(-1))
+        
+        # Backward
+        optimizer.zero_grad()
+        loss.backward()
+        
+        # Clip gradient
+        nn.utils.clip_grad_norm(model.parameters(), 5)
+        optimizer.step()
+        
+        train_loss += loss.data[0]
+    print('epoch: {}, perplexity is: {:.3f}, lr:{:.1e}'.format(e+1, np.exp(train_loss / len(train_data)), optimizer.lr))
+
+import pickle
+torch.save(model_object, 'model.pkl')
+
+model = torch.load('model.pkl')
+
+# 生成文本,默认选择概率最高的5个，随机选择一个作为输出，剩下来的传递到下一个cell; torch.topk
+def pick_top_n(preds, top_n=5):
+    top_pred_prob, top_pred_label = torch.topk(preds, top_n, 1)
+    top_pred_prob /= torch.sum(top_pred_prob)
+    top_pred_prob = top_pred_prob.squeeze(0).cpu().numpy()
+    top_pred_label = top_pred_label.squeeze(0).cpu().numpy()
+    c = np.random.choice(top_pred_label, size = 1, p = top_pred_prob)
+    return c
+
+begin = '天青色等烟雨'
+text_len = 30
+
+model = model.eval()
+samples = [convert.word_to_int(c) for c in begin]
+input_txt = torch.LongTensor(samples)[None]
+if use_gpu:
+    input_txt = input_txt.cuda()
+input_txt = Variable(input_txt)
+_, init_state = model(input_txt)
+result = samples
+model_input = input_txt[:, -1][:, None]
+for i in range(text_len):
+    out, init_state = model(model_input, init_state)
+    pred = pick_top_n(out.data)
+    model_input = Variable(torch.LongTensor(pred))[None]
+    if use_gpu:
+        model_input = model_input.cuda()
+    result.append(pred[0])
+text = convert.arr_to_text(result)
+print('Generate text is: {}'.format(text))    
+        
+
+        
+    
      
         
         
